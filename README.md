@@ -11,9 +11,14 @@ go run ./cmd/nartar tar2nar -i input.tar -o output.nar
 
 Use `-` for stdin/stdout.
 
-Build a binary:
+## Installation
 
-```
+Ensure you have Go 1.20 or later installed.
+
+```bash
+git clone https://github.com/godsarmy/nartar.git
+cd nartar
+go mod tidy
 go build -o nartar ./cmd/nartar
 ```
 
