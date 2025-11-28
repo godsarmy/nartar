@@ -152,12 +152,8 @@ func narToTar(in io.Reader, out io.Writer) error {
 			return fmt.Errorf("reading nar header: %w", err)
 		}
 
-		if hdr.Path == "/" {
-			continue
-		}
-
-		name := strings.TrimPrefix(filepath.ToSlash(hdr.Path), "/")
-		if name == "" {
+		name, skip := tarPathForNarHeader(hdr)
+		if skip {
 			continue
 		}
 
@@ -228,12 +224,12 @@ func tarToNar(in io.Reader, out io.Writer) error {
 			return fmt.Errorf("reading tar: %w", err)
 		}
 
-		p, err := normalizeTarPath(th.Name)
+		p, skip, err := normalizeTarPath(th.Name)
 		if err != nil {
 			return fmt.Errorf("invalid tar entry path %q: %w", th.Name, err)
 		}
 
-		if p == "/" {
+		if skip {
 			continue
 		}
 
@@ -269,10 +265,13 @@ func tarToNar(in io.Reader, out io.Writer) error {
 		}
 	}
 
-	paths := make([]string, 0, len(entries)+1)
-	paths = append(paths, "/")
+	rootEntry := entries["/"]
+
+	paths := make([]string, 0, len(entries))
 	for p := range entries {
-		paths = append(paths, p)
+		if p != "/" {
+			paths = append(paths, p)
+		}
 	}
 	sort.Strings(paths)
 
@@ -281,45 +280,27 @@ func tarToNar(in io.Reader, out io.Writer) error {
 		return fmt.Errorf("creating nar writer: %w", err)
 	}
 
-	if err := nw.WriteHeader(&nar.Header{Path: "/", Type: nar.TypeDirectory}); err != nil {
-		return fmt.Errorf("writing nar root: %w", err)
+	if rootEntry != nil {
+		if rootEntry.kind != tar.TypeDir && len(paths) > 0 {
+			return fmt.Errorf("root file with additional entries is not supported")
+		}
+
+		if err := writeNarEntry(nw, rootEntry); err != nil {
+			return fmt.Errorf("writing nar root: %w", err)
+		}
+	} else {
+		if err := nw.WriteHeader(&nar.Header{Path: "/", Type: nar.TypeDirectory}); err != nil {
+			return fmt.Errorf("writing nar root: %w", err)
+		}
 	}
 
 	for _, p := range paths {
-		if p == "/" {
-			continue
-		}
-
 		entry := entries[p]
 		if entry == nil {
 			continue
 		}
 
-		switch entry.kind {
-		case tar.TypeDir:
-			err = nw.WriteHeader(&nar.Header{Path: p, Type: nar.TypeDirectory})
-		case tar.TypeSymlink:
-			err = nw.WriteHeader(&nar.Header{
-				Path:       p,
-				Type:       nar.TypeSymlink,
-				LinkTarget: entry.linkTarget,
-			})
-		case tar.TypeReg:
-			h := &nar.Header{
-				Path:       p,
-				Type:       nar.TypeRegular,
-				Size:       int64(len(entry.data)),
-				Executable: entry.executable,
-			}
-
-			if err = nw.WriteHeader(h); err == nil {
-				_, err = nw.Write(entry.data)
-			}
-		default:
-			err = fmt.Errorf("unsupported entry type %v", entry.kind)
-		}
-
-		if err != nil {
+		if err := writeNarEntry(nw, entry); err != nil {
 			return fmt.Errorf("writing nar for %q: %w", p, err)
 		}
 	}
@@ -327,30 +308,38 @@ func tarToNar(in io.Reader, out io.Writer) error {
 	return nw.Close()
 }
 
-func normalizeTarPath(name string) (string, error) {
+func normalizeTarPath(name string) (string, bool, error) {
 	name = filepath.ToSlash(name)
+
+	if strings.Contains(name, "\x00") {
+		return "", false, fmt.Errorf("path contains null byte")
+	}
+
 	name = strings.TrimPrefix(name, "./")
 
 	trimmed := strings.TrimPrefix(name, "/")
 	if trimmed == "" || trimmed == "." {
-		return "/", nil
+		return "", true, nil
 	}
+
+	if !strings.HasPrefix(trimmed, "-") {
+		return "", true, nil
+	}
+
+	trimmed = strings.TrimPrefix(trimmed, "-")
+	trimmed = strings.TrimPrefix(trimmed, "/")
 
 	clean := path.Clean("/" + trimmed)
 
-	if clean == "/" {
-		return "/", nil
-	}
-
-	if strings.Contains(clean, "\x00") {
-		return "", fmt.Errorf("path contains null byte")
+	if clean == "/" && trimmed != "" {
+		return "", false, fmt.Errorf("invalid normalized path")
 	}
 
 	if strings.HasPrefix(clean, "/..") || strings.Contains(clean, "/../") {
-		return "", fmt.Errorf("path attempts to escape root")
+		return "", false, fmt.Errorf("path attempts to escape root")
 	}
 
-	return clean, nil
+	return clean, false, nil
 }
 
 func ensureParentDirs(p string, entries map[string]*tarEntry) {
@@ -370,6 +359,54 @@ func pickFileMode(exec bool) int64 {
 	}
 
 	return fileMode
+}
+
+func tarPathForNarHeader(hdr *nar.Header) (string, bool) {
+	p := filepath.ToSlash(hdr.Path)
+
+	if p == "/" {
+		if hdr.Type == nar.TypeRegular {
+			return "-", false
+		}
+
+		return "", true
+	}
+
+	trimmed := strings.TrimPrefix(p, "/")
+	if trimmed == "" {
+		return "", true
+	}
+
+	return path.Join("-", trimmed), false
+}
+
+func writeNarEntry(nw *nar.Writer, entry *tarEntry) error {
+	switch entry.kind {
+	case tar.TypeDir:
+		return nw.WriteHeader(&nar.Header{Path: entry.path, Type: nar.TypeDirectory})
+	case tar.TypeSymlink:
+		return nw.WriteHeader(&nar.Header{
+			Path:       entry.path,
+			Type:       nar.TypeSymlink,
+			LinkTarget: entry.linkTarget,
+		})
+	case tar.TypeReg:
+		h := &nar.Header{
+			Path:       entry.path,
+			Type:       nar.TypeRegular,
+			Size:       int64(len(entry.data)),
+			Executable: entry.executable,
+		}
+
+		if err := nw.WriteHeader(h); err != nil {
+			return err
+		}
+
+		_, err := nw.Write(entry.data)
+		return err
+	default:
+		return fmt.Errorf("unsupported entry type %v", entry.kind)
+	}
 }
 
 func exitErr(err error) {
